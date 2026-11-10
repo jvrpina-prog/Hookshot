@@ -667,6 +667,10 @@ void ensure_layout(Program& p) {
 VkPipelineCache pcache = VK_NULL_HANDLE;
 std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{0};
+// (arc-a380) A compile of a second or more saves the cache at the next check, however few were built: Intel's compiler
+// took 1-25 s for each of Ocarina of Time's compute pipelines, fewer than 32 of them, and a driver crash before any save
+// lost every one, so each start compiled them again behind a black screen for minutes
+std::atomic<bool> pcache_slow_unsaved{false};
 void pcache_init() {
     if (pcache) return;
     char exe[MAX_PATH];
@@ -6454,6 +6458,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 }
                 const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
                 if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms (on a worker)", (unsigned long long)q.key, (long long)ms);
+                if (ms >= 1000) pcache_slow_unsaved = true;
                 st_pipeline_us += ms * 1000;
                 st_pipelines++;
                 pcache_built_since_save++;
@@ -6505,6 +6510,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         {
             const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms", (unsigned long long)p.key, (long long)ms);
+            if (ms >= 1000) pcache_slow_unsaved = true;
         }
         st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         st_pipelines++;
@@ -6797,8 +6803,7 @@ int64_t draw_desc_reused() {
 }
 
 void pipeline_cache_save(bool force) {
-    if (!pcache || (!force && pcache_built_since_save < 32)) return;
-    pcache_built_since_save = 0;
+    if (!pcache || (!force && pcache_built_since_save < 32 && !pcache_slow_unsaved.load())) return;
     // (on a thread of its own unless forced, at exit: ~100 MB fetched and written took the replay thread 100+ ms at
     // each scene change; the cache is internally synchronized, pipelines go on being built meanwhile)
     static std::atomic<bool> busy{false};
@@ -6807,6 +6812,8 @@ void pipeline_cache_save(bool force) {
         while (busy.load()) Sleep(1);   // (the one under way, then this one)
         busy = true;
     }
+    pcache_built_since_save = 0;
+    pcache_slow_unsaved = false;
     auto save = [] {
         size_t n = 0;
         if (vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) == VK_SUCCESS && n) {
